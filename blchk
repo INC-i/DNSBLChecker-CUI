@@ -1,0 +1,176 @@
+#!/usr/bin/perl -sw
+
+=pod
+
+[使用方法]
+
+基本的には、「blchk」のみで検査可能です。
+
+設定値をスクリプトを編集することなく、変更するには下記のようにオプションを指定します。
+blchk th=[スレッド数] pi=[ipアドレスリストのパス] pb=[DNSBLリストのパス]
+
+[使用例]
+
+1) blchk
+2) blchk th=100
+3) blchk pi=.iplist_test pb=.bllist_test
+CSVに出力する場合
+4) blchk > output.csv
+
+=cut
+
+use threads;
+use Thread::Queue;
+use threads::shared;
+use Time::HiRes;
+use Net::DNS;
+
+################
+# 自由に変更可 #
+################
+
+# スレッド数
+my $th_cnt = `cat /proc/cpuinfo | grep -c processor`;
+chomp $th_cnt;
+# IPアドレスのリストファイルのパス
+my $iplist_path = ".iplist";
+# DNSBLホスト名一覧のパス
+my $bllist_path = ".bllist";
+# CSVの区切り文字
+my $dlm = ",";
+
+############
+# 変更不可 #
+############
+
+# 問い合わせ処理開始時間を代入
+my $start_time = Time::HiRes::time;
+# IPアドレス格納用キュー
+my $queue = new Thread::Queue;
+# 現在の検索終了したクエリの数を代入
+my $pcnt : shared = 0;
+# スレッド格納配列
+my @th;
+# 検査結果を格納するハッシュ
+my %RESULT : shared;
+# 総クエリ数
+my $sumq = 0;
+# IPを格納する配列
+my @iplist;
+# DNSBLのホスト名を格納する配列
+my @bllist;
+# 進捗表示
+my $prog = "[%-f%%][%25s]";
+
+main();
+
+sub main {
+
+    # 引数チェック
+    if( $#ARGV >= 0 && $#ARGV < 5 ){
+	    for( my $i=0 ; $i<=$#ARGV ; $i++ ){
+            if($ARGV[$i] =~/^th=(\d+)$/){
+                $th_cnt = $1;
+		    }elsif($ARGV[$i] =~/^pi=(.*)$/){
+		        $iplist_path = $1;
+		    }elsif($ARGV[$i] =~/^pb=(.*)$/){
+			    $bllist_path = $1;
+            }else{
+			    die sprintf("%s is invalid argument. %s\n", $ARGV[$i], $!); 
+		    }
+	    }
+    }elsif($#ARGV >= 5){
+        die sprintf("invalid argument! %s\nusage : blchk pi=\"./iplist\" th=10\n", $!);
+    }
+
+    # DNSBLのリストをインポート
+    open( FH, "<" , $bllist_path ) or die sprintf("Cannot open %s: %s", $bllist_path, $!);
+    while(<FH>){
+	    chomp $_;
+        if ($_ =~/^#/){
+            # comment行なので無視
+            next;
+	    }elsif($_ !~/^(([a-zA-Z]|[a-zA-Z][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z]|[A-Za-z][A-Za-z0-9\-]*[A-Za-z0-9])$/){
+            die "$_ is not fqdn.";
+        }
+	    push( @bllist , $_);
+    }
+    close(FH);
+    # IPアドレスのリストをインポート
+    open( FH, "<" , $iplist_path ) or die sprintf("Cannot open %s: %s", $iplist_path, $!);
+    while(<FH>){
+	    my $ip = $_;
+        chomp $ip;
+        if ($_ =~/^#/){
+            # comment行なので無視
+            next;
+	    }elsif($ip !~/^[1-9]\d{0,2}\.\d{0,3}\.\d{0,3}\.\d{0,3}$/){
+	        die "$ip is not ipv4 address.";
+        }
+        $queue->enqueue($ip);
+	    push( @iplist , $ip);
+    }
+    close(FH);
+
+    $sumq = scalar(@bllist) * scalar(@iplist);
+    if ($sumq == 0) {
+        die sprintf("%s or %s is empty file.", $iplist_path, $bllist_path);
+    }
+    # 検査前出力
+    printf( STDERR "Create %s threads.\n%s IPs * %s BLs\nquery count : %s\n\n", 
+            $th_cnt, scalar(@iplist), scalar(@bllist), $sumq);
+    
+    # スレッド作成
+    for( my $i=0 ; $i<$th_cnt ; $i++ ){
+        my $new_th = threads->new(\&send_query);
+        push(@th,$new_th);
+        $queue->enqueue(undef);
+    }
+    # スレッド結合
+    foreach(@th){
+	    $_->join;
+    }
+
+    # 検査後出力
+    print "IP / BL";
+    foreach(@bllist){print "$dlm$_";}
+    print "\n";
+    foreach(@iplist){
+        my $ip = $_;
+        print $ip;
+        foreach(@bllist){
+            $bl = $_;
+            print $dlm.$RESULT{$ip.$bl};
+        }
+        print "\n";
+    }
+    printf( STDERR "\n%s query done.\n", $sumq);
+    printf( STDERR "Duration : %0.3f[s]\n", Time::HiRes::time - $start_time);
+}
+
+# スレッド内処理
+sub send_query {
+    my $res = Net::DNS::Resolver->new;
+    while (my $ip = $queue->dequeue){
+        my $revip = join(".", reverse(split(/\./,$ip)));
+        foreach(@bllist){
+            my $query = $res->search($revip.$_);
+		    if($query) {
+                foreach my $rr ($query->answer){
+                    next unless $rr->type eq 'A';
+                    $RESULT{$ip.$_} = 'Bad';
+                }
+            }else{
+                $RESULT{$ip.$_} = 'Good';
+            }
+		    $pcnt++;
+		    my $per = $pcnt/$sumq;
+            local $| = 1;
+		    printf( STDERR $prog , $per*100, ('*' x int($per*25)).('.' x (25 - int($per*25))));
+            print STDERR "\r";
+		}
+    }
+}
+
+__END__
+
